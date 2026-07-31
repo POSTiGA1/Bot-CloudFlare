@@ -204,6 +204,7 @@
     "server_recovered_notification": "✅ <b>بازیابی سرور</b> ✅\n\n<b>قانون:</b> <code>{policy_name}</code>\n<b>آیپی:</b> <code>{ip}</code> اکنون دوباره آنلاین است.\n\n<i>توجه: اگر این آیپی، سرور اصلی شما باشد و DNS به آیپی بکاپ اشاره کند، بازگشت خودکار طبق زمان‌بندی انجام خواهد شد.</i>",
     "failback_alert_notification": "✅ <b>سرور اصلی بازیابی شد</b> ✅\n\n<b>قانون:</b> {policy_name}\n<b>آیپی:</b> <code>{primary_ip}</code> دوباره آنلاین است\n\nبازگشت خودکار به این آیپی تا <b>{failback_minutes}</b> دقیقه دیگر انجام خواهد شد.",
     "failback_executed_notification": "🔄 <b>بازگشت خودکار به سرور اصلی انجام شد</b> 🔄\n\n<b>قانون:</b> {policy_name}\n<b>عملیات:</b> رکوردهای DNS با موفقیت به آیپی اصلی (<code>{primary_ip}</code>) برگردانده شدند.",
+    "primary_ip_change_applied_notification": "🔄 <b>تغییر آیپی اصلی اعمال شد</b> 🔄\n\n<b>قانون:</b> {policy_name}\n<b>آیپی اصلی قبلی:</b> <code>{from_ip}</code>\n<b>آیپی اصلی جدید:</b> <code>{to_ip}</code>\n<b>تعداد رکوردهای تغییرکرده در این بررسی:</b> {updated_count}\n<b>تعداد رکوردهای تأییدشده:</b> {total_records}\n\nتمام رکوردهای انتخاب‌شده روی آیپی اصلی جدید بررسی و تأیید شدند.",
     "policy_added_successfully": "✅ قانون جدید با نام <b>{name}</b> با موفقیت افزوده شد.",
     "invalid_ip": "❌ آدرس آیپی وارد شده معتبر نیست. لطفاً دوباره تلاش کنید.",
     "invalid_port": "❌ پورت وارد شده معتبر نیست. لطفاً یک عدد بین 1 و 65535 وارد کنید.",

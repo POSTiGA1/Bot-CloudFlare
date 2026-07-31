@@ -1194,6 +1194,87 @@ async def get_policy_current_dns_ip(policy: dict) -> str | None:
     actual_record = next((r for r in all_dns_records if get_short_name(r['name'], zone_name) in record_names), None)
     return actual_record.get('content') if actual_record else None
 
+async def get_policy_dns_sync_status(policy: dict, expected_ip: str) -> dict:
+    """Checks every DNS record selected by a policy against the expected IP."""
+    provider = get_policy_provider(policy)
+    account_nickname = policy.get('account_nickname')
+    token = get_account_token(provider, account_nickname)
+    zone_name = policy.get('zone_name')
+    expected_names = {str(name) for name in policy.get('record_names', []) if name}
+
+    if not all([token, zone_name, expected_names, expected_ip]):
+        return {
+            "success": False,
+            "error": "incomplete_policy",
+            "total_records": 0,
+            "mismatched_records": [],
+            "missing_record_names": sorted(expected_names),
+        }
+
+    zone_identifier = zone_name
+    if provider == 'cloudflare':
+        zones = await get_all_zones(token)
+        zone_identifier = next((z['id'] for z in zones if z['name'] == zone_name), None)
+        if not zone_identifier:
+            return {
+                "success": False,
+                "error": "zone_not_found",
+                "total_records": 0,
+                "mismatched_records": [],
+                "missing_record_names": sorted(expected_names),
+            }
+
+    all_dns_records = await get_provider_dns_records(provider, token, zone_identifier)
+    if all_dns_records is None:
+        return {
+            "success": False,
+            "error": "records_unavailable",
+            "total_records": 0,
+            "mismatched_records": [],
+            "missing_record_names": sorted(expected_names),
+        }
+
+    selected_records = [
+        record for record in all_dns_records
+        if get_short_name(record.get('name', ''), zone_name) in expected_names
+    ]
+    found_names = {
+        get_short_name(record.get('name', ''), zone_name)
+        for record in selected_records
+    }
+    missing_names = sorted(expected_names - found_names)
+    mismatched_records = [
+        record.get('name', '?')
+        for record in selected_records
+        if record.get('content') != expected_ip
+    ]
+
+    return {
+        "success": bool(selected_records) and not missing_names and not mismatched_records,
+        "error": None,
+        "total_records": len(selected_records),
+        "mismatched_records": mismatched_records,
+        "missing_record_names": missing_names,
+    }
+
+def clear_pending_primary_change(policy_name: str, expected_ip: str) -> bool:
+    """Clears a completed pending change without overwriting newer config edits."""
+    latest_config = load_config()
+    if not latest_config:
+        return False
+
+    for latest_policy in latest_config.get('failover_policies', []):
+        if latest_policy.get('policy_name') != policy_name:
+            continue
+        pending = latest_policy.get('pending_primary_change') or {}
+        if latest_policy.get('primary_ip') != expected_ip or pending.get('to_ip') != expected_ip:
+            return False
+        latest_policy.pop('pending_primary_change', None)
+        save_config(latest_config)
+        return True
+
+    return False
+
 async def check_ip_health(ip: str, port: int, timeout: int = 5) -> bool:
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout)
@@ -1341,10 +1422,11 @@ async def _run_single_health_check_with_timeout(context: ContextTypes.DEFAULT_TY
 
         return True, True
 
-async def perform_health_checks(context: ContextTypes.DEFAULT_TYPE, unique_checks: dict) -> tuple[dict, bool]:
+async def perform_health_checks(context: ContextTypes.DEFAULT_TYPE, unique_checks: dict) -> tuple[dict, bool, set]:
     """
     Performs concurrent health checks for all provided IPs.
-    Returns a dictionary of health results and a boolean indicating if any monitoring service failed.
+    Unknown results are returned separately so one failed Check-Host request does
+    not block unrelated policies or get treated as an online server.
     """
     checks_to_perform = list(unique_checks.values())
     try:
@@ -1365,20 +1447,23 @@ async def perform_health_checks(context: ContextTypes.DEFAULT_TYPE, unique_check
 
     health_results = {}
     service_failure_detected = False
+    unknown_ips = set()
 
     for i, check in enumerate(checks_to_perform):
         ip = check['ip']
         if isinstance(results[i], Exception):
-            health_results[ip] = True
             service_failure_detected = True
+            unknown_ips.add(ip)
             logger.error(f"Health check for IP {ip} failed with an exception: {results[i]}", exc_info=isinstance(results[i], Exception))
         else:
             is_online, service_failed_for_ip = results[i]
-            health_results[ip] = is_online
             if service_failed_for_ip:
                 service_failure_detected = True
+                unknown_ips.add(ip)
+            else:
+                health_results[ip] = is_online
 
-    return health_results, service_failure_detected
+    return health_results, service_failure_detected, unknown_ips
 
 async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
     async with health_check_lock:
@@ -1400,7 +1485,7 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 return
 
             checks_started_at = time.monotonic()
-            health_results, service_failure_detected_in_job = await perform_health_checks(context, unique_checks)
+            health_results, service_failure_detected_in_job, unknown_health_ips = await perform_health_checks(context, unique_checks)
             logger.info(f"[HEALTH TIMER] health check stage finished in {time.monotonic() - checks_started_at:.1f}s.")
 
             now_iso = datetime.now().isoformat()
@@ -1415,9 +1500,8 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     await send_notification(context, SUPER_ADMIN_IDS, 'messages.check_host_api_down_alert', add_settings_button=True)
                 logger.warning(
                     "[HEALTH CHECK] Monitoring results are incomplete/unknown. "
-                    "Skipping DNS policy processing and standalone monitor state updates to prevent false UP/DOWN alerts or wrong DNS changes."
+                    f"Only affected policies will be skipped. Unknown IPs: {sorted(unknown_health_ips)}"
                 )
-                return
             elif context.bot_data.get('check_host_failure_count', 0) > 0:
                 context.bot_data['check_host_failure_count'] = 0
                 logger.info("Check-Host service has recovered.")
@@ -1468,7 +1552,18 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         current_pool_with_weights.append({"ip": value, "weight": weight})
 
-                healthy_lb_ips_with_weights = [ip_info for ip_info in current_pool_with_weights if health_results.get(ip_info['ip'], True)]
+                unknown_lb_ips = sorted({
+                    ip_info['ip'] for ip_info in current_pool_with_weights
+                    if ip_info['ip'] in unknown_health_ips
+                })
+                if unknown_lb_ips:
+                    logger.warning(
+                        f"Skipping LB policy '{policy_name}' because health is unknown "
+                        f"for: {unknown_lb_ips}"
+                    )
+                    continue
+
+                healthy_lb_ips_with_weights = [ip_info for ip_info in current_pool_with_weights if health_results.get(ip_info['ip']) is True]
 
                 if not healthy_lb_ips_with_weights:
                     logger.warning(f"All IPs for LB policy '{policy_name}' are down! No action taken.")
@@ -1579,11 +1674,17 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                 if is_hybrid_mode:
                     effective_primary_ip = lb_active_ips_map[record_key]
+                    backup_ips = policy.get('backup_ips', [])
+                    if effective_primary_ip in unknown_health_ips:
+                        logger.warning(
+                            f"Skipping hybrid Failover policy '{policy_name}' because health "
+                            f"is unknown for active IP '{effective_primary_ip}'."
+                        )
+                        continue
                     is_lb_ip_online = health_results.get(effective_primary_ip, True)
                     if not is_lb_ip_online:
                         logger.warning(f"HYBRID FAILOVER: Active LB IP '{effective_primary_ip}' for '{policy_name}' is DOWN. Switching to Failover backups.")
-                        backup_ips = policy.get('backup_ips', [])
-                        next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip, True)), None)
+                        next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip) is True), None)
                         if next_healthy_backup:
                             monitoring_log.append({
                                 "timestamp": now_iso,
@@ -1614,6 +1715,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         primary_ip_to_use_for_notification = primary_ip_or_host
                     else:
                         primary_ip_to_use = primary_ips_resolved[0]
+                        if primary_ip_to_use in unknown_health_ips:
+                            logger.warning(
+                                f"Skipping Failover policy '{policy_name}' because health is "
+                                f"unknown for primary IP '{primary_ip_to_use}'."
+                            )
+                            continue
                         is_primary_online = health_results.get(primary_ip_to_use, True)
                         primary_ip_to_use_for_notification = primary_ip_to_use
 
@@ -1629,6 +1736,80 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                     recipient_key = f"__policy__{policy_name}"
                     if recipient_key in recipients_map: recipients_to_notify.update(recipients_map[recipient_key])
                     else: recipients_to_notify.update(recipients_map["__default__"])
+
+                    pending_primary_change = policy.get('pending_primary_change') or {}
+                    pending_target_ip = pending_primary_change.get('to_ip')
+                    pending_requires_failback = bool(pending_primary_change.get('requires_failback', False))
+
+                    if pending_target_ip == primary_ip_or_host and not is_primary_online and not pending_requires_failback:
+                        if not mark_pending_primary_change_requires_failback(policy_name, primary_ip_or_host):
+                            logger.warning(
+                                f"PRIMARY CHANGE SYNC: Could not persist the DOWN state for "
+                                f"'{policy_name}'. Deferring DNS actions until the next check."
+                            )
+                            continue
+                        pending_primary_change['requires_failback'] = True
+                        pending_primary_change['primary_down_observed_at'] = now_iso
+                        pending_requires_failback = True
+                        logger.info(
+                            f"PRIMARY CHANGE SYNC: New primary '{primary_ip_or_host}' for "
+                            f"'{policy_name}' is DOWN. Future recovery will follow auto-failback "
+                            f"and the configured failback delay."
+                        )
+
+                    if pending_target_ip == primary_ip_or_host and is_primary_online and not pending_requires_failback:
+                        logger.info(
+                            f"PRIMARY CHANGE SYNC: Applying pending primary IP change for "
+                            f"'{policy_name}' to '{primary_ip_to_use}'."
+                        )
+                        updated_count = await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
+                        sync_status = await get_policy_dns_sync_status(policy, primary_ip_to_use)
+
+                        if sync_status.get('success'):
+                            change_cleared = clear_pending_primary_change(policy_name, primary_ip_or_host)
+                            if not change_cleared:
+                                logger.warning(
+                                    f"PRIMARY CHANGE SYNC: DNS was verified for '{policy_name}', "
+                                    "but a newer config change exists. The current pending state was preserved."
+                                )
+                                continue
+
+                            policy.pop('pending_primary_change', None)
+                            policy_status.pop('uptime_start', None)
+                            policy_status.pop('downtime_start', None)
+                            policy_status['critical_alert_sent'] = False
+                            monitoring_log.append({
+                                "timestamp": now_iso,
+                                "event_type": "PRIMARY_IP_CHANGE",
+                                "policy_name": policy_name,
+                                "from_ip": pending_primary_change.get('from_ip', '-'),
+                                "to_ip": primary_ip_to_use,
+                                "updated_records": updated_count,
+                                "total_records": sync_status.get('total_records', 0),
+                            })
+                            await send_notification(
+                                context,
+                                recipients_to_notify,
+                                'messages.primary_ip_change_applied_notification',
+                                policy_name=policy_name,
+                                from_ip=pending_primary_change.get('from_ip', '-'),
+                                to_ip=primary_ip_to_use,
+                                updated_count=updated_count,
+                                total_records=sync_status.get('total_records', 0),
+                                add_settings_button=True,
+                            )
+                            logger.info(
+                                f"PRIMARY CHANGE SYNC: Verified all "
+                                f"{sync_status.get('total_records', 0)} record(s) for '{policy_name}'."
+                            )
+                        else:
+                            logger.error(
+                                f"PRIMARY CHANGE SYNC: Verification failed for '{policy_name}'. "
+                                f"Mismatched records: {sync_status.get('mismatched_records', [])}; "
+                                f"missing names: {sync_status.get('missing_record_names', [])}; "
+                                f"error: {sync_status.get('error')}. The change remains pending for retry."
+                            )
+                        continue
 
                     if is_primary_online:
                         if policy_status.get('downtime_start') or policy_status.get('critical_alert_sent'):
@@ -1654,10 +1835,54 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                                 uptime_dt = datetime.fromisoformat(policy_status['uptime_start'])
                                 if (datetime.now() - uptime_dt) >= timedelta(minutes=policy.get('failback_minutes', 5.0)):
                                     logger.info(f"FAILBACK TRIGGERED for '{policy_name}'. Switching to primary IP {primary_ip_to_use}.")
-                                    monitoring_log.append({"timestamp": now_iso, "event_type": "FAILBACK", "policy_name": policy_name, "to_ip": primary_ip_to_use})
-                                    await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
-                                    await send_notification(context, recipients_to_notify, 'messages.failback_executed_notification',
-                                                            policy_name=policy_name, primary_ip=primary_ip_to_use_for_notification, add_settings_button=True)
+                                    updated_count = await switch_dns_ip(context, policy, to_ip=primary_ip_to_use)
+                                    sync_status = await get_policy_dns_sync_status(policy, primary_ip_to_use)
+                                    if not sync_status.get('success'):
+                                        logger.error(
+                                            f"FAILBACK verification failed for '{policy_name}'. "
+                                            f"Mismatched records: {sync_status.get('mismatched_records', [])}; "
+                                            f"missing names: {sync_status.get('missing_record_names', [])}. "
+                                            "The next health check will retry."
+                                        )
+                                        continue
+
+                                    monitoring_log.append({
+                                        "timestamp": now_iso,
+                                        "event_type": "FAILBACK",
+                                        "policy_name": policy_name,
+                                        "from_ip": actual_ip_on_cf,
+                                        "to_ip": primary_ip_to_use,
+                                        "mode": "pending_primary_change" if pending_requires_failback else "standard",
+                                    })
+
+                                    if pending_target_ip == primary_ip_or_host and pending_requires_failback:
+                                        if not clear_pending_primary_change(policy_name, primary_ip_or_host):
+                                            logger.warning(
+                                                f"FAILBACK for '{policy_name}' was verified, but a newer "
+                                                "config change exists. Its pending state was preserved."
+                                            )
+                                            continue
+                                        policy.pop('pending_primary_change', None)
+                                        await send_notification(
+                                            context,
+                                            recipients_to_notify,
+                                            'messages.primary_ip_change_applied_notification',
+                                            policy_name=policy_name,
+                                            from_ip=pending_primary_change.get('from_ip', '-'),
+                                            to_ip=primary_ip_to_use,
+                                            updated_count=updated_count,
+                                            total_records=sync_status.get('total_records', 0),
+                                            add_settings_button=True,
+                                        )
+                                    else:
+                                        await send_notification(
+                                            context,
+                                            recipients_to_notify,
+                                            'messages.failback_executed_notification',
+                                            policy_name=policy_name,
+                                            primary_ip=primary_ip_to_use_for_notification,
+                                            add_settings_button=True,
+                                        )
                                     policy_status.pop('uptime_start', None)
 
                             else:
@@ -1671,6 +1896,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
                     else:
                         policy_status.pop('uptime_start', None)
+                        if actual_ip_on_cf in unknown_health_ips:
+                            logger.warning(
+                                f"Skipping Failover actions for '{policy_name}' because health "
+                                f"is unknown for the active DNS IP '{actual_ip_on_cf}'."
+                            )
+                            continue
                         is_current_ip_online = health_results.get(actual_ip_on_cf, True)
                         is_on_valid_backup = actual_ip_on_cf in backup_ips
 
@@ -1698,7 +1929,15 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                                     logger.info(f"'{policy_name}' is still within its grace period. Waiting...")
                                     continue
 
-                            next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip, True)), None)
+                            next_healthy_backup = next((ip for ip in backup_ips if health_results.get(ip) is True), None)
+                            unknown_backup_ips = [ip for ip in backup_ips if ip in unknown_health_ips]
+
+                            if not next_healthy_backup and unknown_backup_ips:
+                                logger.warning(
+                                    f"Deferring Failover decision for '{policy_name}' because "
+                                    f"backup health is unknown for: {unknown_backup_ips}"
+                                )
+                                continue
 
                             if next_healthy_backup:
                                 if next_healthy_backup != actual_ip_on_cf:
@@ -1741,6 +1980,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                 is_currently_online = True
 
                 if is_valid_ip(input_addr):
+                    if input_addr in unknown_health_ips:
+                        logger.warning(
+                            f"Skipping standalone monitor '{monitor_name}' because health "
+                            f"is unknown for '{input_addr}'."
+                        )
+                        continue
                     is_currently_online = health_results.get(input_addr, True)
                 else:
                     resolved_monitor_ips = await resolve_dns_to_ips(input_addr)
@@ -1748,6 +1993,12 @@ async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
                         is_currently_online = False
                         logger.warning(f"Monitor '{monitor_name}': Could not resolve domain '{input_addr}'. Treating as DOWN.")
                     else:
+                        if any(ip in unknown_health_ips for ip in resolved_monitor_ips):
+                            logger.warning(
+                                f"Skipping standalone monitor '{monitor_name}' because one or "
+                                f"more resolved IP health results are unknown."
+                            )
+                            continue
                         statuses = [health_results.get(rip, False) for rip in resolved_monitor_ips if rip in health_results]
 
                         if statuses:
@@ -5281,8 +5532,27 @@ async def _handle_state_edit_policy_field(update: Update, context: ContextTypes.
 
         config = load_config()
         policy_list_key = 'load_balancer_policies' if policy_type == 'lb' else 'failover_policies'
-        config[policy_list_key][policy_index][field] = value_to_save
+        policy_to_update = config[policy_list_key][policy_index]
+        old_value = policy_to_update.get(field)
+        policy_to_update[field] = value_to_save
+
+        if policy_type == 'failover' and field == 'primary_ip' and old_value != value_to_save:
+            existing_pending = policy_to_update.get('pending_primary_change') or {}
+            policy_to_update['pending_primary_change'] = {
+                "from_ip": existing_pending.get('from_ip', old_value),
+                "to_ip": value_to_save,
+                "changed_at": datetime.now().isoformat(),
+                "requires_failback": False,
+            }
         save_config(config)
+
+        if policy_type == 'failover' and field == 'primary_ip' and old_value != value_to_save:
+            policy_name = policy_to_update.get('policy_name', 'Unnamed')
+            reset_policy_health_status(context, policy_name)
+            logger.info(
+                f"Primary IP for policy '{policy_name}' changed from '{old_value}' "
+                f"to '{value_to_save}'. DNS sync is pending until the next valid health check."
+            )
 
         field_name = get_text(f'field_names.{field}', lang)
         await send_or_edit(update, context, get_text('messages.policy_field_updated', lang, field=field_name))
@@ -9075,6 +9345,27 @@ async def clear_monitoring_state_on_startup(application: Application):
     else:
         logger.info("No monitoring state found to reset.")
 
+def mark_pending_primary_change_requires_failback(policy_name: str, expected_ip: str) -> bool:
+    """Persists that a manually selected primary was confirmed DOWN."""
+    latest_config = load_config()
+    if not latest_config:
+        return False
+
+    for latest_policy in latest_config.get('failover_policies', []):
+        if latest_policy.get('policy_name') != policy_name:
+            continue
+        pending = latest_policy.get('pending_primary_change') or {}
+        if latest_policy.get('primary_ip') != expected_ip or pending.get('to_ip') != expected_ip:
+            return False
+        if not pending.get('requires_failback', False):
+            pending['requires_failback'] = True
+            pending['primary_down_observed_at'] = datetime.now().isoformat()
+            latest_policy['pending_primary_change'] = pending
+            save_config(latest_config)
+        return True
+
+    return False
+
 async def sync_dns_with_config(context: ContextTypes.DEFAULT_TYPE):
     """
     On startup, syncs DNS records for failover policies to their primary IP.
@@ -9093,6 +9384,12 @@ async def sync_dns_with_config(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             policy_name = policy.get('policy_name', 'Unnamed Policy')
+            if policy.get('pending_primary_change'):
+                logger.info(
+                    f"Skipping startup sync for '{policy_name}' because a primary IP "
+                    "change is pending health validation."
+                )
+                continue
             primary_ip = policy.get('primary_ip')
 
             target_ip = primary_ip
